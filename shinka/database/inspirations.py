@@ -1,9 +1,22 @@
+import json
 import logging
 import sqlite3
 from abc import ABC, abstractmethod
-from typing import Optional, Callable, Any, List, Set, Literal
+from typing import Optional, Callable, Any, Dict, List, Set, Literal
 
 logger = logging.getLogger(__name__)
+
+
+def _load_json_dict(text: Optional[str]) -> Dict[str, Any]:
+    """Decode a JSON object column the way ``ProgramDatabase._program_from_row``
+    does: missing, invalid, or non-object payloads become ``{}``."""
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 class ContextSelectorStrategy(ABC):
@@ -170,16 +183,19 @@ class TopKInspirationSelector(ContextSelectorStrategy):
         if not hasattr(self.config, "archive_size") or self.config.archive_size <= 0:
             return []
 
-        # Query archive for programs
+        # Query archive for candidate programs. Only the columns needed for
+        # ranking are fetched here: hydrating a full program row (code,
+        # embedding, metadata JSON) is the expensive part, so that is
+        # deferred to the k winners below.
         placeholders = ",".join("?" * len(excluded_ids))
 
         if enforce_separation and parent_island_idx is not None:
             # Only search within parent's island
             query = f"""
-                SELECT p.*
+                SELECT p.id, p.combined_score, p.public_metrics
                 FROM programs p
                 JOIN archive a ON p.id = a.program_id
-                WHERE p.island_idx = ? AND p.id NOT IN ({placeholders}) 
+                WHERE p.island_idx = ? AND p.id NOT IN ({placeholders})
                 AND p.correct = 1
             """
             params = [parent_island_idx] + list(excluded_ids)
@@ -187,10 +203,10 @@ class TopKInspirationSelector(ContextSelectorStrategy):
         else:
             # Search globally across all islands
             query = f"""
-                SELECT p.*
+                SELECT p.id, p.combined_score, p.public_metrics
                 FROM programs p
                 JOIN archive a ON p.id = a.program_id
-                WHERE p.id NOT IN ({placeholders}) 
+                WHERE p.id NOT IN ({placeholders})
                 AND p.correct = 1
             """
             params = list(excluded_ids)
@@ -205,27 +221,23 @@ class TopKInspirationSelector(ContextSelectorStrategy):
             )
             return []
 
-        archive_programs = [
-            self.program_from_row(row) for row in archive_rows if self.program_from_row
-        ]
-        archive_programs = [p for p in archive_programs if p]
-
-        if not archive_programs:
-            return []
-
         # Sort by performance - prioritize combined_score, then average metrics
-        def sort_key(prog: Any) -> float:
-            if prog.combined_score is not None:
-                return prog.combined_score
-            elif prog.public_metrics:
-                return sum(prog.public_metrics.values()) / len(prog.public_metrics)
-            else:
-                return -float("inf")
+        def sort_key(row: sqlite3.Row) -> float:
+            if row["combined_score"] is not None:
+                return row["combined_score"]
+            public_metrics = _load_json_dict(row["public_metrics"])
+            if public_metrics:
+                return sum(public_metrics.values()) / len(public_metrics)
+            return -float("inf")
 
-        sorted_programs = sorted(archive_programs, key=sort_key, reverse=True)
+        sorted_rows = sorted(archive_rows, key=sort_key, reverse=True)
 
-        # Return top-k programs
-        top_k = sorted_programs[:k]
+        # Load full program objects for the top-k rows only
+        top_k: List[Any] = []
+        for row in sorted_rows[:k]:
+            prog = self.get_program(row["id"])
+            if prog:
+                top_k.append(prog)
 
         if top_k:
             inspiration_details = [
